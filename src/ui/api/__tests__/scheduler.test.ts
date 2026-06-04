@@ -246,6 +246,47 @@ describe("scheduler API", () => {
 		expect(body.job.consecutiveErrors).toBe(0);
 	});
 
+	test("POST /:id/resume without body is a no-op on a failed job", async () => {
+		const job = scheduler.createJob({
+			name: "stuck-failed",
+			schedule: { kind: "every", intervalMs: 60_000 },
+			task: "go",
+		});
+		db.run("UPDATE scheduled_jobs SET status = 'failed' WHERE id = ?", [job.id]);
+		const res = await handleUiRequest(req(`/ui/api/scheduler/${job.id}/resume`, { method: "POST" }));
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { job: { status: string } };
+		expect(body.job.status).toBe("failed");
+	});
+
+	test("POST /:id/resume with force=true revives a failed job and audits as resume:force", async () => {
+		const job = scheduler.createJob({
+			name: "circuit-broken",
+			schedule: { kind: "every", intervalMs: 60_000 },
+			task: "go",
+		});
+		db.run("UPDATE scheduled_jobs SET status = 'failed', consecutive_errors = 10, next_run_at = NULL WHERE id = ?", [
+			job.id,
+		]);
+		const res = await handleUiRequest(
+			req(`/ui/api/scheduler/${job.id}/resume`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ force: true }),
+			}),
+		);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { job: { status: string; consecutiveErrors: number; nextRunAt: string | null } };
+		expect(body.job.status).toBe("active");
+		expect(body.job.consecutiveErrors).toBe(0);
+		expect(body.job.nextRunAt).toBeTruthy();
+
+		const audit = db.query("SELECT action FROM scheduler_audit_log WHERE job_id = ?").all(job.id) as Array<{
+			action: string;
+		}>;
+		expect(audit.some((a) => a.action === "resume:force")).toBe(true);
+	});
+
 	test("POST /:id/run runs the job and returns the result", async () => {
 		const job = scheduler.createJob({
 			name: "run-me",

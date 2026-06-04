@@ -151,20 +151,26 @@ export class Scheduler {
 	}
 
 	/**
-	 * Flip a paused job back to active. Recomputes next_run_at from the stored
-	 * schedule so a job paused mid-interval resumes on a fresh cadence.
-	 * Resets consecutive_errors so a job paused in its backoff fan-out gets a
-	 * clean retry budget. Returns the updated job, or null if the id does not
-	 * exist.
+	 * Flip a paused or failed job back to active. Recomputes next_run_at from
+	 * the stored schedule so a resumed job picks up on a fresh cadence, and
+	 * resets consecutive_errors so it gets a clean retry budget.
+	 *
+	 * Default behavior accepts only `paused`. Pass `force: true` to also revive
+	 * `failed` jobs (the ones the executor circuit-broke after
+	 * MAX_CONSECUTIVE_ERRORS). The operator opts in because they know the
+	 * underlying cause has cleared. `completed` is never revivable here:
+	 * `at`-kind one-shots may have already deleted themselves
+	 * (executor.ts deleteAfterRun path) and `cron`/`every` jobs do not reach
+	 * `completed` through the normal lifecycle.
+	 *
+	 * Returns the updated job, or null if the id does not exist.
 	 */
-	resumeJob(id: string): ScheduledJob | null {
+	resumeJob(id: string, options?: { force?: boolean }): ScheduledJob | null {
 		const job = this.getJob(id);
 		if (!job) return null;
-		// Only paused jobs may be resumed. Failed and completed are terminal
-		// states; force-reviving them would bypass the lifecycle (e.g.,
-		// re-running a one-shot that already deleted itself, or restarting a
-		// circuit-broken job without addressing the failure).
-		if (job.status !== "paused") return job;
+		const force = options?.force === true;
+		const eligible = job.status === "paused" || (force && job.status === "failed");
+		if (!eligible) return job;
 		const nextRun = computeNextRunAt(job.schedule);
 		const nextRunIso = nextRun ? nextRun.toISOString() : null;
 		this.db.run(
@@ -173,7 +179,7 @@ export class Scheduler {
 					next_run_at = ?,
 					consecutive_errors = 0,
 					updated_at = datetime('now')
-				WHERE id = ? AND status = 'paused'`,
+				WHERE id = ? AND status IN ('paused', 'failed')`,
 			[nextRunIso, id],
 		);
 		this.armTimer();

@@ -56,6 +56,10 @@ const PreviewSchema = z.object({
 	schedule: ScheduleInputSchema,
 });
 
+const ResumeSchema = z.object({
+	force: z.boolean().optional(),
+});
+
 function json(body: unknown, init?: ResponseInit): Response {
 	return new Response(JSON.stringify(body), {
 		...init,
@@ -268,15 +272,34 @@ function handlePause(deps: SchedulerApiDeps, id: string): Response {
 	return json({ job: updated });
 }
 
-function handleResume(deps: SchedulerApiDeps, id: string): Response {
+async function handleResume(req: Request, deps: SchedulerApiDeps, id: string): Promise<Response> {
 	const before = deps.scheduler.getJob(id);
 	if (!before) return errJson("Job not found", 404);
-	const updated = deps.scheduler.resumeJob(id);
+
+	// Body is optional. Empty body means force=false; non-empty body must parse
+	// to { force?: boolean }. Read once via .text() so missing content-length
+	// (which Bun does not set on Request objects built in tests) does not
+	// suppress force=true.
+	let force = false;
+	const rawText = await req.text();
+	if (rawText.trim().length > 0) {
+		let raw: unknown;
+		try {
+			raw = JSON.parse(rawText);
+		} catch {
+			return errJson("Invalid JSON body", 400);
+		}
+		const parsed = ResumeSchema.safeParse(raw);
+		if (!parsed.success) return errJson(zodErrorMessage(parsed.error), 400);
+		force = parsed.data.force === true;
+	}
+
+	const updated = deps.scheduler.resumeJob(id, { force });
 	if (!updated) return errJson("Job not found", 404);
 	writeAudit(deps.db, {
 		jobId: updated.id,
 		jobName: updated.name,
-		action: "resume",
+		action: force ? "resume:force" : "resume",
 		previousStatus: before.status,
 		newStatus: updated.status,
 	});
@@ -357,7 +380,7 @@ export async function handleSchedulerApi(req: Request, url: URL, deps: Scheduler
 	const resumeMatch = pathname.match(/^\/ui\/api\/scheduler\/([^/]+)\/resume$/);
 	if (resumeMatch) {
 		if (req.method !== "POST") return errJson("Method not allowed", 405);
-		return handleResume(deps, resumeMatch[1]);
+		return handleResume(req, deps, resumeMatch[1]);
 	}
 
 	const runMatch = pathname.match(/^\/ui\/api\/scheduler\/([^/]+)\/run$/);
